@@ -33,6 +33,7 @@ import copy
 import os
 import shutil
 import time
+from types import SimpleNamespace
 from typing import Any, Union
 
 import torch
@@ -113,6 +114,28 @@ def is_hybrid_diffusion_model(model_or_path):
     return _find_ar_component_name(model_or_path) is not None
 
 
+def _build_partial_pipeline_proxy(
+    model_path: str,
+    ar_component_name: str,
+    ar_model: torch.nn.Module,
+    processor=None,
+    tokenizer=None,
+):
+    """Build a lightweight pipe-like object for AR-only hybrid workflows.
+
+    This keeps just enough state for AR quantization and later pipeline-metadata
+    export without instantiating the diffusion branch in memory.
+    """
+    pipe = SimpleNamespace(
+        config=SimpleNamespace(_name_or_path=model_path),
+        name_or_path=model_path,
+        processor=processor,
+        tokenizer=tokenizer,
+    )
+    setattr(pipe, ar_component_name, ar_model)
+    return pipe
+
+
 class HybridCompressor(DiffusionCompressor):
     """Compressor for hybrid AR + diffusion models.
 
@@ -190,11 +213,36 @@ class HybridCompressor(DiffusionCompressor):
 
         # --- Load the pipeline ---
         if isinstance(model, str):
-            from auto_round.utils.model import diffusion_load_model
+            ar_component_name = _find_ar_component_name(model)
+            if quant_ar and not quant_dit and ar_component_name is not None:
+                from auto_round.utils.model import mllm_load_model
 
-            pipe, dit_model = diffusion_load_model(
-                model, platform=platform, device=self.device, model_dtype=model_dtype
-            )
+                load_kwargs = dict(kwargs)
+                load_device = device_map
+                if isinstance(device_map, dict):
+                    load_kwargs["device_map"] = device_map
+                    load_device = self.device
+                ar_model, processor, tokenizer, _ = mllm_load_model(
+                    model,
+                    platform=platform,
+                    device=load_device,
+                    model_dtype=model_dtype,
+                    **load_kwargs,
+                )
+                pipe = _build_partial_pipeline_proxy(
+                    model,
+                    ar_component_name=ar_component_name,
+                    ar_model=ar_model,
+                    processor=processor,
+                    tokenizer=tokenizer,
+                )
+                dit_model = None
+            else:
+                from auto_round.utils.model import diffusion_load_model
+
+                pipe, dit_model = diffusion_load_model(
+                    model, platform=platform, device=self.device, model_dtype=model_dtype
+                )
         elif isinstance(model, pipeline_utils.DiffusionPipeline):
             pipe = model
             dit_model = pipe.transformer
@@ -216,16 +264,19 @@ class HybridCompressor(DiffusionCompressor):
         if not self.quant_ar and not self.quant_dit:
             raise ValueError("At least one of quant_ar and quant_dit must be True.")
 
-        model = dit_model
+        model = dit_model if self.quant_dit else self.ar_model
 
         # --- Detect DiT blocks ---
-        all_blocks = get_block_names(model)
-        dit_blocks = find_matching_blocks(model, all_blocks, to_quant_block_names)
+        if self.quant_dit and model is not None:
+            all_blocks = get_block_names(model)
+            dit_blocks = find_matching_blocks(model, all_blocks, to_quant_block_names)
+        else:
+            dit_blocks = []
 
         # Filter to only blocks whose class has a registered output_config.
         # get_block_names may discover non-transformer ModuleLists (e.g. MLP projectors)
         # that don't match the expected output format.
-        if to_quant_block_names is None:
+        if self.quant_dit and to_quant_block_names is None:
             filtered = []
             for group in dit_blocks:
                 if not group:
@@ -250,16 +301,16 @@ class HybridCompressor(DiffusionCompressor):
                     self.ar_model, quant_vision=quant_nontext_module
                 )
             else:
-                self.ar_quant_block_list = [get_block_names(self.ar_model)]
+                self.ar_quant_block_list = get_block_names(self.ar_model)
         else:
             self.ar_quant_block_list = []
 
-        self.quant_block_list = self.dit_quant_block_list
+        self.quant_block_list = self.dit_quant_block_list if self.quant_dit else self.ar_quant_block_list
         if to_quant_block_names is None:
             to_quant_block_names = extract_block_names_to_str(self.quant_block_list)
 
         # Force batch_size to 1 for diffusion calibration
-        if iters > 0 and batch_size != 1:
+        if self.quant_dit and iters > 0 and batch_size != 1:
             logger.warning(
                 f"reset batch_size({batch_size}) to 1 and "
                 f"gradient_accumulate_steps({gradient_accumulate_steps}) "
@@ -275,7 +326,7 @@ class HybridCompressor(DiffusionCompressor):
             nsamples = (nsamples // batch_size + 1) * batch_size
             logger.warning(f"'nsamples' is not divisible by 'batch_size', adjusted to {nsamples}")
 
-        kwargs["diffusion"] = True
+        kwargs["diffusion"] = self.quant_dit
         self._saved_pipe = pipe
         self._saved_dit_model = dit_model
         self._saved_ar_model = self.ar_model
@@ -376,7 +427,7 @@ class HybridCompressor(DiffusionCompressor):
 
         self.quantized = True
         self.layer_config = combined_layer_config
-        self.model = self.dit_model
+        self.model = self.dit_model if self.dit_model is not None else self.ar_model
         return self.model, self.layer_config
 
     def _create_ar_compressor(self):
@@ -644,7 +695,7 @@ class HybridCompressor(DiffusionCompressor):
 
         self.formats = saved_formats
         self._save_pipeline_metadata(output_dir)
-        self.model = self.dit_model
+        self.model = self.dit_model if self.dit_model is not None else self.ar_model
         logger.info(f"Full hybrid quantized model saved to {output_dir}")
 
     def _save_pipeline_metadata(self, output_dir):
@@ -652,12 +703,18 @@ class HybridCompressor(DiffusionCompressor):
         src_path = getattr(getattr(self.pipe, "config", None), "_name_or_path", None) or getattr(
             self.pipe, "name_or_path", None
         )
-        if src_path and os.path.exists(os.path.join(src_path, "model_index.json")):
-            import shutil
+        if src_path:
+            try:
+                from auto_round.export.utils import _copy_pipeline_artifacts
 
-            dst_index = os.path.join(output_dir, "model_index.json")
-            if not os.path.exists(dst_index):
-                shutil.copy2(os.path.join(src_path, "model_index.json"), dst_index)
+                excluded = set()
+                if self.quant_ar and self.ar_component_name is not None:
+                    excluded.add(self.ar_component_name)
+                if self.quant_dit:
+                    excluded.add("transformer")
+                _copy_pipeline_artifacts(src_path, output_dir, exclude_components=excluded)
+            except Exception as e:
+                logger.warning("Failed to copy pipeline artifacts from %s: %s", src_path, e)
 
         # Save non-quantized pipeline components so the exported directory remains
         # loadable as a complete diffusers pipeline even when only one branch is quantized.

@@ -203,8 +203,17 @@ class MLLMCompressor(BaseCompressor):
         self._set_device(device_map)
 
         if isinstance(model, str):
+            load_kwargs = dict(kwargs)
+            load_device = device_map
+            if isinstance(device_map, dict):
+                load_kwargs["device_map"] = device_map
+                load_device = self.device
             model, processor, tokenizer, image_processor = mllm_load_model(
-                model, platform=platform, device=self.device, model_dtype=model_dtype
+                model,
+                platform=platform,
+                device=load_device,
+                model_dtype=model_dtype,
+                **load_kwargs,
             )
 
         self.model = model
