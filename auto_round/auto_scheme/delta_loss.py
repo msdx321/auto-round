@@ -973,7 +973,7 @@ def gen_layer_config(
     if isinstance(model, str):
         model_name = model
         # Load model on CPU only; do not apply automatic device map or tuning-aware placement at load time.
-        model, tokenizer, _ = llm_load_model(model_name, device_map="cpu")
+        model, tokenizer = llm_load_model(model_name, device_map="cpu")
     # Get major device
     major_device = get_major_device(device_map)
     if not low_gpu_mem_usage:

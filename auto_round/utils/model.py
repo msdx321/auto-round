@@ -251,6 +251,72 @@ def _check_accelerate_version():
         )
 
 
+def _normalize_pretrained_kwargs(kwargs: dict | None) -> dict:
+    """Normalize common alias kwargs used across Transformers versions."""
+    normalized = dict(kwargs or {})
+    if "dtype" in normalized and "torch_dtype" not in normalized:
+        normalized["torch_dtype"] = normalized.pop("dtype")
+    return normalized
+
+
+def _filter_supported_kwargs(callable_obj, kwargs: dict | None) -> dict:
+    """Keep only kwargs accepted by *callable_obj* unless it already accepts **kwargs."""
+    if not kwargs:
+        return {}
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return dict(kwargs)
+    return {name: value for name, value in kwargs.items() if name in signature.parameters}
+
+
+def _resolve_loading_options(device, use_auto_mapping: bool, trust_remote_code: bool, kwargs: dict | None):
+    """Resolve the effective `from_pretrained()` options for model loading."""
+    from auto_round.utils.device import get_device_and_parallelism
+
+    loader_kwargs = _normalize_pretrained_kwargs(kwargs)
+    explicit_device_map = loader_kwargs.pop("device_map", None)
+    resolved_trust_remote_code = loader_kwargs.pop("trust_remote_code", trust_remote_code)
+    resolved_torch_dtype = loader_kwargs.pop("torch_dtype", "auto")
+
+    if isinstance(explicit_device_map, dict):
+        non_cpu_devices = [value for value in explicit_device_map.values() if value not in ("cpu", "disk")]
+        device_str = str(non_cpu_devices[0]) if non_cpu_devices else "cpu"
+        inferred_auto_mapping = False
+        effective_auto_mapping = False
+    else:
+        device_ref = explicit_device_map if explicit_device_map is not None else device
+        device_str, inferred_auto_mapping = get_device_and_parallelism(device_ref)
+        effective_auto_mapping = explicit_device_map is None and use_auto_mapping and inferred_auto_mapping
+
+    if device_str is not None and "hpu" in str(device_str) and resolved_torch_dtype == "auto":
+        resolved_torch_dtype = torch.bfloat16
+
+    model_load_kwargs = {
+        "torch_dtype": resolved_torch_dtype,
+        "trust_remote_code": resolved_trust_remote_code,
+        "device_map": explicit_device_map if explicit_device_map is not None else ("auto" if effective_auto_mapping else None),
+    }
+    return loader_kwargs, model_load_kwargs
+
+
+def _warn_local_path_memory_usage(model_path: str, load_kwargs: dict):
+    """Warn when a local load will likely use peak CPU RAM."""
+    if not os.path.isdir(model_path):
+        return
+    if load_kwargs.get("device_map") is not None:
+        return
+    if load_kwargs.get("low_cpu_mem_usage"):
+        return
+    logger.warning_once(
+        "Loading a local model directory without `low_cpu_mem_usage=True` or a `device_map` "
+        "can temporarily use substantially more CPU RAM during `from_pretrained()`."
+    )
+
+
 _MXFP4_SUPPORTED_MODEL_TYPES = {"gpt_oss"}
 
 
@@ -309,49 +375,54 @@ def llm_load_model(
         _use_hpu_compile_mode,
         fake_cuda_for_hpu,
         fake_triton_for_hpu,
-        get_device_and_parallelism,
         is_hpex_available,
         override_cuda_device_capability,
     )
 
-    device_str, use_auto_mapping = get_device_and_parallelism(device)
-    torch_dtype = "auto"
-    if device_str is not None and "hpu" in device_str:
-        torch_dtype = torch.bfloat16
-
-    load_kwargs = {
-        "torch_dtype": torch_dtype,
-        "trust_remote_code": trust_remote_code,
-        "device_map": "auto" if use_auto_mapping else None,
-    }
+    loader_kwargs, load_kwargs = _resolve_loading_options(
+        device=device,
+        use_auto_mapping=True,
+        trust_remote_code=trust_remote_code,
+        kwargs=kwargs,
+    )
+    _warn_local_path_memory_usage(pretrained_model_name_or_path, {**load_kwargs, **loader_kwargs})
 
     if version.parse(transformers.__version__) >= version.parse("5.0.0"):
-        is_mxfp4 = _is_mxfp4_model(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+        is_mxfp4 = _is_mxfp4_model(
+            pretrained_model_name_or_path,
+            trust_remote_code=load_kwargs["trust_remote_code"],
+        )
         if is_mxfp4:
             from transformers import Mxfp4Config
 
-            load_kwargs["quantization_config"] = Mxfp4Config(dequantized=True)
+            load_kwargs.setdefault("quantization_config", Mxfp4Config(dequantized=True))
             logger.info("Detected MXFP4 quantized model, using Mxfp4Config(dequantized=True) for loading.")
 
     is_glm = bool(re.search("chatglm", pretrained_model_name_or_path.lower()))
 
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+    tokenizer_kwargs = _filter_supported_kwargs(AutoTokenizer.from_pretrained, loader_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path,
+        trust_remote_code=load_kwargs["trust_remote_code"],
+        **tokenizer_kwargs,
+    )
 
     model_cls = AutoModel if is_glm else AutoModelForCausalLM
     if "deepseek" in pretrained_model_name_or_path.lower() and trust_remote_code:
         logger.warning("trust_remote_code is enabled by default, please ensure its correctness.")
+    model_load_kwargs = {**load_kwargs, **_filter_supported_kwargs(model_cls.from_pretrained, loader_kwargs)}
 
     if is_hpex_available():
         # For loading FP8 model on HPU
         with fake_cuda_for_hpu(), fake_triton_for_hpu(), override_cuda_device_capability():
-            model = model_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+            model = model_cls.from_pretrained(pretrained_model_name_or_path, **model_load_kwargs)
     else:
         try:
-            model = model_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+            model = model_cls.from_pretrained(pretrained_model_name_or_path, **model_load_kwargs)
         except ValueError as e:
             if "FP8 quantized" in str(e):
                 with override_cuda_device_capability():
-                    model = model_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+                    model = model_cls.from_pretrained(pretrained_model_name_or_path, **model_load_kwargs)
                 logger.warning("the support for fp8 model as input is experimental, please use with caution.")
             else:
                 raise
@@ -359,7 +430,7 @@ def llm_load_model(
         except OSError as e:
             logger.warning(f"fail to load {pretrained_model_name_or_path}, set trust_remote_code to False and retry.")
             model = model_cls.from_pretrained(
-                pretrained_model_name_or_path, **{**load_kwargs, "trust_remote_code": False}
+                pretrained_model_name_or_path, **{**model_load_kwargs, "trust_remote_code": False}
             )
 
     model = model.eval()
@@ -471,12 +542,16 @@ def mllm_load_model(
 
         base_lib = transformers
 
-    from auto_round.utils.device import get_device_and_parallelism, override_cuda_device_capability
+    from auto_round.utils.device import override_cuda_device_capability
 
-    device_str, use_auto_mapping = get_device_and_parallelism(device)
-    torch_dtype = "auto"
-    if device_str is not None and "hpu" in device_str:
-        torch_dtype = torch.bfloat16
+    loader_kwargs, base_model_load_kwargs = _resolve_loading_options(
+        device=device,
+        use_auto_mapping=use_auto_mapping,
+        trust_remote_code=trust_remote_code,
+        kwargs=kwargs,
+    )
+    torch_dtype = base_model_load_kwargs["torch_dtype"]
+    _warn_local_path_memory_usage(pretrained_model_name_or_path, {**base_model_load_kwargs, **loader_kwargs})
     model_subfolder = None
     processor_subfolder = None
     if os.path.isdir(pretrained_model_name_or_path):
@@ -489,9 +564,13 @@ def mllm_load_model(
     else:
         from huggingface_hub import hf_hub_download, list_repo_files
 
-        file_list = list_repo_files(pretrained_model_name_or_path)
+        file_list = list_repo_files(pretrained_model_name_or_path, **_filter_supported_kwargs(list_repo_files, loader_kwargs))
         if "config.json" in file_list:
-            config_path = hf_hub_download(pretrained_model_name_or_path, "config.json")
+            config_path = hf_hub_download(
+                pretrained_model_name_or_path,
+                "config.json",
+                **_filter_supported_kwargs(hf_hub_download, loader_kwargs),
+            )
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
         elif "model_index.json" in file_list:
@@ -502,7 +581,11 @@ def mllm_load_model(
             # Load gzipped JSON
             import gzip
 
-            config_path = hf_hub_download(pretrained_model_name_or_path, "config.json.gz")
+            config_path = hf_hub_download(
+                pretrained_model_name_or_path,
+                "config.json.gz",
+                **_filter_supported_kwargs(hf_hub_download, loader_kwargs),
+            )
             with gzip.open(config_path, "rt", encoding="utf-8") as f:
                 config = json.load(f)
         else:
@@ -531,13 +614,18 @@ def mllm_load_model(
     if "deepseek_vl_v2" == model_type:
         from deepseek_vl2.models import DeepseekVLV2ForCausalLM, DeepseekVLV2Processor  # pylint: disable=E0401
 
-        processor = DeepseekVLV2Processor.from_pretrained(pretrained_model_name_or_path)
+        processor = DeepseekVLV2Processor.from_pretrained(
+            pretrained_model_name_or_path,
+            **_filter_supported_kwargs(DeepseekVLV2Processor.from_pretrained, loader_kwargs),
+        )
         tokenizer = processor.tokenizer
+        model_load_kwargs = {
+            **base_model_load_kwargs,
+            **_filter_supported_kwargs(AutoModelForCausalLM.from_pretrained, loader_kwargs),
+        }
         model: DeepseekVLV2ForCausalLM = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=torch_dtype,
-            device_map="auto" if use_auto_mapping else None,
+            **model_load_kwargs,
         )
     else:
         architectures = config["architectures"][0]
@@ -560,29 +648,23 @@ def mllm_load_model(
             else:
                 cls = AutoModelForCausalLM
             try:
-                model_load_kwargs = {}
+                model_load_kwargs = {
+                    **base_model_load_kwargs,
+                    **_filter_supported_kwargs(cls.from_pretrained, loader_kwargs),
+                }
                 if model_subfolder is not None:
                     model_load_kwargs["subfolder"] = model_subfolder
-                model = cls.from_pretrained(
-                    pretrained_model_name_or_path,
-                    trust_remote_code=trust_remote_code,
-                    torch_dtype=torch_dtype,
-                    device_map="auto" if use_auto_mapping else None,
-                    **model_load_kwargs,
-                )
+                model = cls.from_pretrained(pretrained_model_name_or_path, **model_load_kwargs)
             except ValueError as e:
                 if "FP8 quantized" in str(e):
                     with override_cuda_device_capability():
-                        model_load_kwargs = {}
+                        model_load_kwargs = {
+                            **base_model_load_kwargs,
+                            **_filter_supported_kwargs(cls.from_pretrained, loader_kwargs),
+                        }
                         if model_subfolder is not None:
                             model_load_kwargs["subfolder"] = model_subfolder
-                        model = cls.from_pretrained(
-                            pretrained_model_name_or_path,
-                            trust_remote_code=trust_remote_code,
-                            torch_dtype=torch_dtype,
-                            device_map="auto" if use_auto_mapping else None,
-                            **model_load_kwargs,
-                        )
+                        model = cls.from_pretrained(pretrained_model_name_or_path, **model_load_kwargs)
                     logger.warning("the support for fp8 model as input is experimental, please use with caution.")
                 else:
                     raise
@@ -595,18 +677,20 @@ def mllm_load_model(
                 else:
                     tokenizer = MistralTokenizer.from_hf_hub(pretrained_model_name_or_path)
             else:
-                processor_load_kwargs = {}
+                tokenizer_load_kwargs = _filter_supported_kwargs(AutoTokenizer.from_pretrained, loader_kwargs)
+                processor_load_kwargs = _filter_supported_kwargs(AutoProcessor.from_pretrained, loader_kwargs)
                 if processor_subfolder is not None:
+                    tokenizer_load_kwargs["subfolder"] = processor_subfolder
                     processor_load_kwargs["subfolder"] = processor_subfolder
                 tokenizer = AutoTokenizer.from_pretrained(
                     pretrained_model_name_or_path,
-                    trust_remote_code=trust_remote_code,
+                    trust_remote_code=base_model_load_kwargs["trust_remote_code"],
                     fix_mistral_regex=True if model_type in FIX_MISTRAL_REGEX_MODEL_TYPE_LIST else False,
-                    **processor_load_kwargs,
+                    **tokenizer_load_kwargs,
                 )
                 processor = AutoProcessor.from_pretrained(
                     pretrained_model_name_or_path,
-                    trust_remote_code=trust_remote_code,
+                    trust_remote_code=base_model_load_kwargs["trust_remote_code"],
                     **processor_load_kwargs,
                 )
             try:
@@ -615,12 +699,12 @@ def mllm_load_model(
                 else:
                     from transformers import AutoImageProcessor
 
-                image_processor_load_kwargs = {}
+                image_processor_load_kwargs = _filter_supported_kwargs(AutoImageProcessor.from_pretrained, loader_kwargs)
                 if processor_subfolder is not None:
                     image_processor_load_kwargs["subfolder"] = processor_subfolder
                 image_processor = AutoImageProcessor.from_pretrained(
                     pretrained_model_name_or_path,
-                    trust_remote_code=trust_remote_code,
+                    trust_remote_code=base_model_load_kwargs["trust_remote_code"],
                     **image_processor_load_kwargs,
                 )
             except Exception as e:
@@ -664,10 +748,12 @@ def diffusion_load_model(
             f"auto_round current only support hf as platform for diffusion model, but get {platform}"
         )
 
-    device_str, use_auto_mapping = get_device_and_parallelism(device)
-    torch_dtype = "auto"
+    device_str, inferred_auto_mapping = get_device_and_parallelism(device)
+    use_auto_mapping = use_auto_mapping and inferred_auto_mapping
+    loader_kwargs = _normalize_pretrained_kwargs(kwargs)
+    torch_dtype = loader_kwargs.pop("torch_dtype", torch_dtype)
     if device_str is not None and "hpu" in device_str:
-        torch_dtype = torch.bfloat16
+        torch_dtype = torch.bfloat16 if torch_dtype == "auto" else torch_dtype
 
     try:
         from transformers import AutoConfig
@@ -699,8 +785,17 @@ def diffusion_load_model(
                         component_config = json.load(file)
                     torch_dtype[k] = component_config.get("torch_dtype", "auto")
 
+        pipe_load_kwargs = _filter_supported_kwargs(
+            pipelines.auto_pipeline.AutoPipelineForText2Image.from_pretrained,
+            loader_kwargs,
+        )
+        if use_auto_mapping and "device_map" not in pipe_load_kwargs:
+            pipe_load_kwargs["device_map"] = "auto"
+        _warn_local_path_memory_usage(pretrained_model_name_or_path, {**pipe_load_kwargs, "torch_dtype": torch_dtype})
         pipe = pipelines.auto_pipeline.AutoPipelineForText2Image.from_pretrained(
-            pretrained_model_name_or_path, torch_dtype=torch_dtype
+            pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            **pipe_load_kwargs,
         )
         pipe_config = pipe.load_config(pretrained_model_name_or_path)
 
