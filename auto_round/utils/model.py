@@ -259,6 +259,40 @@ def _normalize_pretrained_kwargs(kwargs: dict | None) -> dict:
     return normalized
 
 
+_PRETRAINED_LOADER_KWARGS = {
+    "attn_implementation",
+    "cache_dir",
+    "device_map",
+    "force_download",
+    "ignore_mismatched_sizes",
+    "local_dir",
+    "local_files_only",
+    "max_memory",
+    "mirror",
+    "offload_buffers",
+    "offload_folder",
+    "offload_state_dict",
+    "proxies",
+    "quantization_config",
+    "resume_download",
+    "revision",
+    "subfolder",
+    "token",
+    "trust_remote_code",
+    "use_auth_token",
+    "use_safetensors",
+    "variant",
+    "weights_only",
+    "low_cpu_mem_usage",
+}
+
+
+def extract_pretrained_loader_kwargs(kwargs: dict | None) -> dict:
+    """Return only kwargs relevant to Hugging Face / ModelScope loader APIs."""
+    normalized = _normalize_pretrained_kwargs(kwargs)
+    return {name: value for name, value in normalized.items() if name in _PRETRAINED_LOADER_KWARGS}
+
+
 def _filter_supported_kwargs(callable_obj, kwargs: dict | None) -> dict:
     """Keep only kwargs accepted by *callable_obj* unless it already accepts **kwargs."""
     if not kwargs:

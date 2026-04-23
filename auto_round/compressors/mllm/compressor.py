@@ -203,7 +203,9 @@ class MLLMCompressor(BaseCompressor):
         self._set_device(device_map)
 
         if isinstance(model, str):
-            load_kwargs = dict(kwargs)
+            from auto_round.utils.model import extract_pretrained_loader_kwargs
+
+            load_kwargs = extract_pretrained_loader_kwargs(kwargs)
             load_device = device_map
             if isinstance(device_map, dict):
                 load_kwargs["device_map"] = device_map
@@ -212,6 +214,7 @@ class MLLMCompressor(BaseCompressor):
                 model,
                 platform=platform,
                 device=load_device,
+                trust_remote_code=load_kwargs.pop("trust_remote_code", True),
                 model_dtype=model_dtype,
                 **load_kwargs,
             )

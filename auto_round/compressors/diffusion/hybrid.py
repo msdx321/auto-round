@@ -215,9 +215,9 @@ class HybridCompressor(DiffusionCompressor):
         if isinstance(model, str):
             ar_component_name = _find_ar_component_name(model)
             if quant_ar and not quant_dit and ar_component_name is not None:
-                from auto_round.utils.model import mllm_load_model
+                from auto_round.utils.model import extract_pretrained_loader_kwargs, mllm_load_model
 
-                load_kwargs = dict(kwargs)
+                load_kwargs = extract_pretrained_loader_kwargs(kwargs)
                 load_device = device_map
                 if isinstance(device_map, dict):
                     load_kwargs["device_map"] = device_map
@@ -226,6 +226,7 @@ class HybridCompressor(DiffusionCompressor):
                     model,
                     platform=platform,
                     device=load_device,
+                    trust_remote_code=load_kwargs.pop("trust_remote_code", True),
                     model_dtype=model_dtype,
                     **load_kwargs,
                 )
